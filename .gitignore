@@ -1,3 +1,5 @@
 data/south_fork/south_fork_vessel_ais.gdb
+data/south_fork/south_fork_vessel_trips.gdb
 python/south_fork/southfork_processrawAIS.py
 python/south_fork/southfork_extracttracklines.py
+R

@@ -6,7 +6,7 @@
 import pandas as pd
 import geopandas as gpd
 from pathlib import Path
-from shapely.geometry import Point, LineString
+from shapely.geometry import LineString
 
 # CONFIGURATION
 # Set folder paths
@@ -15,8 +15,13 @@ gdb_path = base_path / "data" / "south_fork" / "south_fork_vessel_ais.gdb"
 input_layer = "south_fork_vessel_merged"
 ports_layer = "south_fork_ports"
 output_layer = "south_fork_vessel_trips_lines"
+line_gdb = base_path / "data" / "south_fork" / "south_fork_vessel_trips.gdb"
 
-# Port Coordinates for Geofencing
+# State Submerged Land URL
+submergedlands_url = "https://coast.noaa.gov/arcgis/rest/services/Hosted/USStateSubmergedLands/FeatureServer/0/query?where=1%3D1&outFields=*&f=geojson"
+
+# Port Coordinates from South Fork Construction Report
+# Used to create a Port Point Layer for mapping/visualization
 ports_data = {
     'ProvPort': (-71.391, 41.802), 'New_London': (-72.091, 41.354),
     'Point_Judith': (-71.511, 41.379), 'Quonset': (-71.415, 41.585),
@@ -28,7 +33,6 @@ ports_data = {
     'Corpus_Christi': (-97.388, 27.793) #, 'Millville_NJ': (-75.044, 39.213) # Millville, NJ is listed in the report but is not coastal
 }
 
-# Create a point feature class of the port locations (for mapping/visualization)
 # Convert dictionary to a list of records
 ports_list = [{'port_name': name, 'lon': coords[0], 'lat': coords[1]} 
              for name, coords in ports_data.items()]
@@ -45,100 +49,146 @@ ports_gdf = gpd.GeoDataFrame(
 
 # Export to the file geodatabase 
 ports_gdf.to_file(str(gdb_path), layer=ports_layer, driver="OpenFileGDB", engine="pyogrio")
-print(f"---Port point feature class created at {gdb_path}---")
+print(f"--- Port point feature class created at {gdb_path} ---")
 
-# Function to create tracklines
+
+# Inside your run_trackline_pipeline() function:
+print("Fetching submerged lands boundary polygons...")
+submergedlands_url=(submergedlands_url)
+
+# Function to create tracklines from AIS points
 def run_trackline_pipeline():
     # Load the merged point layer
     print(f"Reading points from {input_layer}...")
     gdf = gpd.read_file(str(gdb_path), layer=input_layer, engine="pyogrio")
-    
-    # Ensure column names are standardized
     gdf.columns = gdf.columns.str.upper()
-    if "GEOMETRY" in gdf.columns:
-        gdf = gdf.set_geometry("GEOMETRY")
     gdf['BASEDATETIME'] = pd.to_datetime(gdf['BASEDATETIME'])
+    # Sort points by MMSI and time
     gdf = gdf.sort_values(['MMSI', 'BASEDATETIME'])
-
-    # Build Port Mask for Geofencing
-    print("Creating port geofences...")
-    port_pts = [Point(lon, lat) for lon, lat in ports_data.values()]
-    ports_gdf = gpd.GeoDataFrame({'port_name': list(ports_data.keys())}, geometry=port_pts, crs="EPSG:4326")
-    ports_mask_m = ports_gdf.to_crs(epsg=32618)
-    ports_mask_m['geometry'] = ports_mask_m.buffer(1000) # 1km buffer radius around port points
-    port_mask_geom = ports_mask_m.to_crs(epsg=4326).union_all()
-
-    # Trip Segmentation/Creation & Flagging Logic
-    print("Processing behavioral flags and trip segments...")
+    # Ensure active geometry is set
+    gdf = gdf.set_geometry('GEOMETRY')
     
-    # Port Status
-    # Create column for whether points are within the port geofence
-    gdf['IN_PORT'] = gdf.geometry.within(port_mask_geom)
-    
-    # Create stationary flag (SOG < 1 for > 1 hour)
-    gdf['TIME_DIFF'] = gdf.groupby('MMSI')['BASEDATETIME'].diff().dt.total_seconds() / 3600
-    gdf['IS_LOW_SPEED'] = gdf['SOG'] < 1.0
-    gdf['state_group'] = (gdf['IS_LOW_SPEED'] != gdf['IS_LOW_SPEED'].shift()).cumsum()
-    state_durations = gdf.groupby(['MMSI', 'state_group'])['TIME_DIFF'].transform('sum')
-    gdf['FLAG_STATIONARY'] = ((gdf['IS_LOW_SPEED'] == True) & (state_durations >= 1.0)).astype(int)
+    # Fetch submerged lands boundary polygon
+    print("Fetching submerged lands boundary lines and building spatial index...")
+    print("Fetching submerged lands boundary polygons...")
+    state_waters_gdf = gpd.read_file(submergedlands_url)
+    # Set submerged lands boundary polygon CRS to match AIS data crs
+    if state_waters_gdf.crs != gdf.crs:
+        state_waters_gdf = state_waters_gdf.to_crs(gdf.crs)
 
-    # Status Transitions (Status 1=Anchor, 5=Moored)
-    # Create a new trip when status changes from 1 or 5 to another status
+    # Spatial join (point-in-polygon)
+    # Determine which AIS points are within the state submerged land polygon
+    print("Tagging points inside state waters polygon...")
+    gdf = gpd.sjoin(gdf, state_waters_gdf[['geometry']], how='left', predicate='within')
+    gdf['IN_STATE'] = ~gdf['index_right'].isna()
+
+    # Detect crossing from state to federal waters
+    print("Detecting zone transitions (State vs Federal)...")
+    gdf['ZONE'] = gdf['IN_STATE'].map({True: 'State', False: 'Federal'})
+    gdf['PREV_ZONE'] = gdf.groupby('MMSI')['ZONE'].shift(1)
+
+    # A crossing occurs when the zone changes
+    gdf['ZONE_CROSSING'] = (gdf['ZONE'] != gdf['PREV_ZONE']) & gdf['PREV_ZONE'].notna()
+
+    # GROUP BY CONTINUOUS STAY AND VALIDATE DURATION
+    # Create a unique ID for every vessel for every continuous period in a single zone
+    gdf['STAY_ID'] = gdf.groupby('MMSI')['ZONE'].transform(lambda x: (x != x.shift()).cumsum())
+
+    # Calculate duration for every stay
+    stay_durations = gdf.groupby(['MMSI', 'STAY_ID'])['BASEDATETIME'].agg(['min', 'max'])
+    stay_durations['HOURS'] = (stay_durations['max'] - stay_durations['min']).dt.total_seconds() / 3600
+
+    # Identify stays in state/federal waters that meet the 1-hour threshold
+    # This avoids creating a new trip every time a vessel crosses the state waters boundary
+    valid_map = stay_durations['HOURS'] >= 1.0
+    gdf = gdf.join(valid_map.rename('IS_VALID_TRIP_ZONE'), on=['MMSI', 'STAY_ID'])
+    
+    # Line segment creation
+    print("Creating movement segments...")
+    # Get previous status to know when there are status changes
+    gdf['PREV_STATUS'] = gdf.groupby('MMSI')['STATUS'].shift(1)
+    # Status transition logic
+    print("Processing status transitions (Anchored/Moored)...")
     parked_statuses = [1, 5]
-    gdf['STATUS_CHANGED'] = (
+    # Flag: Transition FROM 1 or 5 TO something else (Starting a trip)
+    gdf['LEFT_PARKED'] = (
         (~gdf['STATUS'].isin(parked_statuses)) & 
-        (gdf['STATUS'].shift(1).isin(parked_statuses))
+        (gdf['PREV_STATUS'].isin(parked_statuses))
+    )
+    
+    # TRIP SEGMENTATION USING RULES
+    print("Segmenting trips based on all rules...")
+    gdf['TIME_DIFF'] = gdf.groupby('MMSI')['BASEDATETIME'].diff().dt.total_seconds() / 3600
+    
+    # New trip if: 
+    # Crossed into state waters and/or came back into federal waters for >1 OR 8hr gap OR Status change (In or Out of Parked) OR First Point
+    gdf['TRIP_START'] = (
+    (gdf['ZONE_CROSSING'] & gdf['IS_VALID_TRIP_ZONE']) | 
+    (gdf['TIME_DIFF'] > 8) |
+    (gdf['LEFT_PARKED'] == True)
     )
 
-    # Trip ID Generation
-    # New trip if: Left Port OR Gap between points > 8hrs OR Status changed from Anchor/Moored
-    gdf['TRIP_START'] = (
-        ((gdf['IN_PORT'] == False) & (gdf['IN_PORT'].shift(1) == True)) | 
-        (gdf['TIME_DIFF'] > 8) |
-        (gdf['STATUS_CHANGED'] == True)
-    )
+    # Ensure the very first point of every vessel starts a trip
+    gdf.loc[gdf.groupby('MMSI').head(1).index, 'TRIP_START'] = True
+    
+    # Generate unique IDs
     gdf['TRIP_ID'] = gdf.groupby('MMSI')['TRIP_START'].cumsum()
 
-    # Connect Points to Lines
-    print("Creating tracklines...")
-    # Group and create lines
+    # CONVERT POINTS TO TRACKLINES
+    print("Building tracklines with location filters...")
+    gdf['POINTS_IN_TRIP'] = gdf.groupby(['MMSI', 'TRIP_ID'])['GEOMETRY'].transform('count')
+    gdf = gdf[gdf['POINTS_IN_TRIP'] >= 2].copy()
+    # Build tracklines
     lines_series = gdf.groupby(['MMSI', 'TRIP_ID'])['GEOMETRY'].apply(
-        lambda x: LineString(x.tolist()) if len(x) >= 2 else None
-    ).dropna()
-    
-    # Explicitly set the geometry column name in the constructor
-    lines_gdf = gpd.GeoDataFrame(
-        lines_series, 
-        geometry='GEOMETRY', 
-        crs="EPSG:4326"
-    ).reset_index()
+        lambda x: LineString(x.tolist())) 
 
-    # Rename to lowercase for GDB standard compatibility
-    lines_gdf = lines_gdf.rename_geometry('geometry')
-
-    # Calculate Trip Metrics (Duration & Distance)
-    print("Calculating trip duration and distance...")
-    
-    # Metadata and Duration
+    # Get metrics including the zone tag
+    # Use 'first' for the zone, assuming the trip mostly stays in the zone that triggered it
     metrics = gdf.groupby(['MMSI', 'TRIP_ID']).agg({
         'BASEDATETIME': ['min', 'max'],
-        'FLAG_STATIONARY': 'max' # Did this trip contain a stationary period?
+        'ZONE': 'first',
+        'STATUS': 'first'
     }).reset_index()
-    metrics.columns = ['MMSI', 'TRIP_ID', 'START_TIME', 'END_TIME', 'HAD_STATIONARY']
-    metrics['DURATION_HRS'] = (metrics['END_TIME'] - metrics['START_TIME']).dt.total_seconds() / 3600
+    metrics.columns = ['MMSI', 'TRIP_ID', 'START_TIME', 'END_TIME', 'TRIP_LOCATION', 'START_STATUS']
+
+    final_lines = gpd.GeoDataFrame(metrics, geometry=lines_series.values, crs="EPSG:4326")
     
-    # Project to UTM 18N for distance (Nautical Miles)
-    lines_utm = lines_gdf.to_crs(epsg=32618)
-    lines_gdf['DIST_NM'] = (lines_utm.geometry.length * 0.000539957)
+    # Nautical Miles Calculation (UTM 18N)
+    final_lines_utm = final_lines.to_crs(epsg=32618)
+    final_lines['DIST_NM'] = (final_lines_utm.geometry.length * 0.000539957)
 
-    # Merge everything
-    final_lines = lines_gdf.merge(metrics, on=['MMSI', 'TRIP_ID'])
-
-    # Final Export to GDB
+    # EXPORT
     print(f"Saving tracklines to {output_layer}...")
-    final_lines.to_file(str(gdb_path), layer=output_layer, driver="OpenFileGDB", engine="pyogrio")
+    final_lines.to_file(
+        str(line_gdb), 
+        layer=output_layer, 
+        driver="OpenFileGDB", 
+        engine="pyogrio",
+        layer_options={'TARGET_ARCGIS_VERSION': 'ARCGIS_PRO_3_2_OR_LATER'}
+    )
+
+    # EXPORT INDIVIDUAL FEATURE CLASSES FOR EACH MMSI
+    print("Exporting individual MMSI layers...")
+    unique_mmsis = final_lines['MMSI'].unique()
+
+    for mmsi in unique_mmsis:
+        # Filter for the specific vessel
+        vessel_gdf = final_lines[final_lines['MMSI'] == mmsi]
+        
+        # Define a clean layer name
+        vessel_layer_name = f"vessel_{int(mmsi)}_lines"
+        
+        vessel_gdf.to_file(
+            str(line_gdb), 
+            layer=vessel_layer_name, 
+            driver="OpenFileGDB", 
+            engine="pyogrio",
+            layer_options={'TARGET_ARCGIS_VERSION': 'ARCGIS_PRO_3_2_OR_LATER'}
+        )
     
-    print("Ship trip creation complete!")
+    print(f"Finished exporting {len(unique_mmsis)} individual vessel layers.")
+    
+    print("\n--- Pipeline Complete ---")
 
 if __name__ == "__main__":
     run_trackline_pipeline()
