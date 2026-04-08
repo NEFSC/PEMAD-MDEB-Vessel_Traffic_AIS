@@ -7,7 +7,6 @@
 import pandas as pd
 import concurrent.futures
 import requests
-#import zipfile
 import zstandard as zstd
 import io
 import os
@@ -19,27 +18,16 @@ import shapely.geometry
 import threading
 import duckdb
 
-# Create a "Lock"
+# Create a "Lock" for thread-safe Parquet writing
 parquet_lock = threading.Lock()
 
-# --- CONFIGURATION ---
-YEAR = 2025
-TARGET_MONTHS = [f"{m:02d}" for m in range(1, 13)] 
-# Updated URL to the new Azure Blob location
-index_url = f"https://noaaocm.blob.core.windows.net/ais/csv2/csv{YEAR}/index.html"
-base_download_url = f"https://noaaocm.blob.core.windows.net/ais/csv2/csv{YEAR}/"
+# --- GLOBAL CONFIGURATION ---
+YEARS_TO_DOWNLOAD = range(2015, 2026) # 2015 through 2025
+TARGET_MONTHS = [f"{m:02d}" for m in range(1, 13)]
 
 project_path = Path("D:/")
 home_directory = Path.home()
 arcgis_path = home_directory / "Documents" / "ArcGIS" / "Projects" / "AIS_Download"
-staging_dir = project_path / "AIS_Staging" / f"AIS_Staging_{YEAR}"
-output_dir = project_path / f"AIS_Monthly_{YEAR}"
-output_path = project_path
-output_csv = project_path / "AIS" / f"Vessels_AIS_{YEAR}.csv"
-# vessel_csv = project_path / "Vessels_SNE.csv"
-
-output_dir.mkdir(parents=True, exist_ok=True)
-staging_dir.mkdir(parents=True, exist_ok=True)
 
 # --- LOAD BOUNDING BOX ---
 gdb_path = arcgis_path / "BoundingBox.gdb"
@@ -56,36 +44,36 @@ try:
     print(f"Filtering with BBox: {XMIN}, {YMIN}, {XMAX}, {YMAX}")
 except Exception as e:
     print(f"Error loading GDB: {e}")
+    exit()
 
 # ---  PARALLEL DOWNLOAD & FILTER ---
-def download_and_filter(url):
+def download_and_filter(url, current_staging_dir):
     filename = os.path.basename(url)
     
-    # Filter by Month Name BEFORE downloading
-    # Filename format: AIS_2018_01_01.zip
+    # Filename format: ais-2024-01-01.csv.zst
     parts = filename.split('-')
     if len(parts) < 3 or parts[2] not in TARGET_MONTHS:
         return None 
 
     parquet_name = filename.replace(".csv.zst", ".parquet")
-    out_path = staging_dir / parquet_name
+    out_path = current_staging_dir / parquet_name
     
     if out_path.exists():
         return f"Already exists: {parquet_name}"
 
     try:
         r = requests.get(url, timeout=60, stream=True)
-        print(f"Checking {filename}: Status {r.status_code}")
         r.raise_for_status() 
 
-        # DECOMPRESS ZST STREAM
         dctx = zstd.ZstdDecompressor()
         with dctx.stream_reader(r.raw) as reader:
-            # Wrap the reader in io.TextIOWrapper to make it readable by pandas
-            # as a standard text/csv stream
             with io.TextIOWrapper(reader, encoding='utf-8') as text_stream:
                 df = pd.read_csv(text_stream, low_memory=False)
                 
+                # --- NORMALIZE COLUMN NAMES ---
+                # This handles shifts between lowercase/uppercase across years
+                df.columns = [c.lower() for c in df.columns]
+
                 # --- DATA QUALITY FILTERS ---
                 df['sog'] = pd.to_numeric(df['sog'], errors='coerce')
                 df['mmsi'] = pd.to_numeric(df['mmsi'], errors='coerce')
@@ -119,156 +107,403 @@ def download_and_filter(url):
     except Exception as e:
         return f"FAILED: {filename} - {e}"
 
-def run_stage_1():
-    print(f"--- Scraping {index_url} ---")
-    response = requests.get(index_url)
-    soup = BeautifulSoup(response.text, 'html.parser')
+def process_year(year):
+    print(f"\n======= STARTING YEAR {year} =======")
     
-    # --- Robust URL Construction ---
-    zst_links = []
-    for l in soup.find_all('a'):
-        href = l.get('href', '')
-        if href.endswith('.csv.zst'):
-            # Construct the full Azure URL
-            clean_href = href.split('/')[-1] # Get just the filename
-            full_url = f"{base_download_url}{clean_href}"
-            zst_links.append(full_url)
+    # 1. SETUP DIRECTORIES
+    staging_dir = project_path / "AIS_Staging" / f"AIS_Staging_{year}"
+    output_dir = project_path / f"AIS_Monthly_{year}"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Found {len(zst_links)} daily files. Starting filter...")
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        results = list(executor.map(download_and_filter, zst_links))
+    # 2. SCRAPE LINKS
+    index_url = f"https://noaaocm.blob.core.windows.net/ais/csv2/csv{year}/index.html"
+    base_download_url = f"https://noaaocm.blob.core.windows.net/ais/csv2/csv{year}/"
     
-    for res in filter(None, results): 
-        print(res)
+    try:
+        response = requests.get(index_url)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        zst_links = []
+        for l in soup.find_all('a'):
+            href = l.get('href', '')
+            if href.endswith('.csv.zst'):
+                clean_href = href.split('/')[-1]
+                zst_links.append(f"{base_download_url}{clean_href}")
 
-def merge_daily_to_monthly():
+        print(f"Found {len(zst_links)} daily files for {year}.")
+
+        # 3. DOWNLOAD IN PARALLEL
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            # We use a helper to pass both the URL and the year-specific staging dir
+            results = list(executor.map(lambda u: download_and_filter(u, staging_dir), zst_links))
+        
+        for res in filter(None, results): 
+            print(res)
+
+    except Exception as e:
+        print(f"Error processing year {year}: {e}")
+
+# --- RUN ---
+if __name__ == "__main__":
+    for year in YEARS_TO_DOWNLOAD:
+        process_year(year)
+
+# --- CONVERT DAILY FILES TO MONTHLY FILES
+def merge_daily_to_monthly_multiyear(years_list):
     # Initialize DuckDB
     con = duckdb.connect()
     
-    print(f"--- Starting Monthly Merge for {YEAR} ---")
-    
-    for month in TARGET_MONTHS:
-        monthly_file = output_dir / f"AIS_{YEAR}_{month}.parquet"
+    for year in years_list:
+        print(f"\n--- Starting Monthly Merge for {year} ---")
         
-        # Pattern to find all daily files for this specific month
-        # Use the hyphen structure to match the new filenames
-        daily_glob = f"ais-{YEAR}-{month}-*.parquet"
-        daily_pattern = str(staging_dir / daily_glob)
+        # DYNAMIC DIRECTORY PATHS
+        # These must match the folder names created during the download stage
+        current_staging_dir = project_path / "AIS_Staging" / f"AIS_Staging_{year}"
+        current_output_dir = project_path / f"AIS_Monthly_{year}"
         
-        # Check if any files actually exist for this month before trying to merge
-        daily_files_list = list(staging_dir.glob(daily_glob))
-        
-        if not daily_files_list:
-            print(f"Skipping Month {month}: No daily files found.")
-            continue
-            
-        print(f"Processing Month {month} ({len(daily_files_list)} files)...")
-        
-        try:
-            # DuckDB SQL to combine all matching files and save to a new Parquet
-            con.execute(f"""
-                COPY (
-                    SELECT * FROM read_parquet('{daily_pattern}', union_by_name=True)
-                ) TO '{monthly_file}' (FORMAT 'PARQUET', COMPRESSION 'ZSTD');
-            """)
-            
-            print(f"Successfully created: {monthly_file.name}")
-            
-            # --- CLEANUP ---
-            # Now that the monthly file is safe, delete the daily staging files to save space
-            # for f in daily_files_list:
-            #     os.remove(f)
-            # print(f"Cleaned up staging files for month {month}.")
-            
-        except Exception as e:
-            print(f"ERROR merging month {month}: {e}")
+        # Ensure output directory exists
+        current_output_dir.mkdir(parents=True, exist_ok=True)
 
-def convert_monthly_parquet_to_csv():
+        for month in TARGET_MONTHS:
+            monthly_file = current_output_dir / f"AIS_{year}_{month}.parquet"
+            
+            # Pattern to find all daily files for this specific year/month
+            daily_glob = f"ais-{year}-{month}-*.parquet"
+            daily_pattern = str(current_staging_dir / daily_glob)
+            
+            # Check if any files actually exist for this month
+            daily_files_list = list(current_staging_dir.glob(daily_glob))
+            
+            if not daily_files_list:
+                # We use a f-string for the skip message to be clear which year failed
+                print(f"Skipping {year}-{month}: No daily files found in {current_staging_dir}")
+                continue
+                
+            if monthly_file.exists():
+                print(f"Skipping {year}-{month}: Monthly file already exists.")
+                continue
+
+            print(f"Processing {year}-{month} ({len(daily_files_list)} files)...")
+            
+            try:
+                # union_by_name=True is critical here because schemas change over 10 years!
+                con.execute(f"""
+                    COPY (
+                        SELECT * FROM read_parquet('{daily_pattern}', union_by_name=True)
+                    ) TO '{monthly_file}' (FORMAT 'PARQUET', COMPRESSION 'ZSTD');
+                """)
+                
+                print(f"Successfully created: {monthly_file.name}")
+                
+                # --- OPTIONAL CLEANUP ---
+                # for f in daily_files_list:
+                #     os.remove(f)
+                
+            except Exception as e:
+                print(f"ERROR merging {year}-{month}: {e}")
+
+# --- RUN ---
+if __name__ == "__main__":
+    # You can pass a range or a specific list
+    target_years = range(2015, 2026) 
+    merge_daily_to_monthly_multiyear(target_years)
+
+# --- CONVERT MONTHLY PARQUET TO MONTHLY CSV
+def convert_monthly_parquet_to_csv_multiyear(years_list):
     """
-    Converts all Parquet files in a folder to CSV.
-    Converts 'geometry_wkb' binary column to a readable WKT string.
+    Iterates through multiple years, finds monthly Parquet files, 
+    and converts them to CSV with readable WKT geometry.
     """
-    # Initialize DuckDB with Spatial support
+    # Initialize DuckDB with Spatial support once
     con = duckdb.connect()
     con.execute("INSTALL spatial; LOAD spatial;")
 
-    # Find all parquet files
-    parquet_files = list(output_dir.glob("*.parquet"))
-    
-    if not parquet_files:
-        print(f"No parquet files found in {output_dir}")
-        return
-
-    print(f"--- Starting CSV Conversion of {len(parquet_files)} files ---")
-
-    for p_file in parquet_files:
-        csv_file = output_dir / p_file.name.replace(".parquet", ".csv")
+    for year in years_list:
+        # Define the directory for the specific year
+        current_output_dir = project_path / f"AIS_Monthly_{year}"
         
-        print(f"Converting {p_file.name} to CSV...")
+        if not current_output_dir.exists():
+            print(f"Skipping Year {year}: Directory {current_output_dir} does not exist.")
+            continue
+
+        # Find all parquet files for this year
+        parquet_files = list(current_output_dir.glob("*.parquet"))
         
+        if not parquet_files:
+            print(f"No parquet files found for {year}.")
+            continue
+
+        print(f"\n--- Starting CSV Conversion for {year} ({len(parquet_files)} files) ---")
+
+        for p_file in parquet_files:
+            csv_file = current_output_dir / p_file.name.replace(".parquet", ".csv")
+            
+            # Skip if CSV already exists to save time on re-runs
+            if csv_file.exists():
+                print(f"  Skipping {p_file.name}: CSV already exists.")
+                continue
+
+            print(f"  Converting {p_file.name}...")
+            
+            try:
+                # SQL logic: 
+                # 1. EXCLUDE binary column and any leftover "junk" columns from previous joins
+                # 2. Convert WKB binary to readable WKT (Well-Known Text)
+                con.execute(f"""
+                    COPY (
+                        SELECT 
+                            * EXCLUDE (
+                                geometry_wkb
+                            ), 
+                            ST_AsText(ST_GeomFromWKB(geometry_wkb)) AS geometry
+                        FROM read_parquet('{p_file}')
+                    ) TO '{csv_file}' (HEADER, DELIMITER ',');
+                """)
+                print(f"    Successfully exported: {csv_file.name}")
+                
+            except Exception as e:
+                print(f"    Failed to convert {p_file.name}: {e}")
+
+# --- RUN ---
+if __name__ == "__main__":
+    # Define years 2015-2025
+    target_years = range(2015, 2026)
+    convert_monthly_parquet_to_csv_multiyear(target_years)
+
+# ---- ADD VESSEL TYPE GROUPS ---
+# Use the vessel type codes csv to map vessel type groups to the finalized datasets
+# Add a column vessel group to all the final data
+
+data_dir = Path("D:/AIS_Monthly_2025")
+mapping_csv = home_directory / "Documents" / "positron" / "PEMAD-MDEB-Vessel_Traffic_AIS" / "data" / "vesseltypecodes.csv"
+
+def add_vessel_groups_recursive():
+    con = duckdb.connect()
+
+    print("--- Loading Mapping Table ---")
+    # Load the mapping CSV and ensure 'Vessel_Type' is treated as an integer
+    con.execute(f"""
+        CREATE TABLE vessel_mapping AS 
+        SELECT DISTINCT 
+            CAST(Vessel_Type AS INTEGER) AS Vessel_Type, 
+            Vessel_Group 
+        FROM read_csv_auto('{mapping_csv}')
+    """)
+
+    # Find all files recursively
+    all_files = list(data_dir.glob("**/*.parquet")) + list(data_dir.glob("**/*.csv"))
+    print(f"Found {len(all_files)} files. Starting processing...")
+
+    for file_path in all_files:
+        if file_path.name.startswith("temp_"):
+            continue
+            
+        print(f"Processing: {file_path.relative_to(data_dir)}")
+        
+        ext = file_path.suffix.lower()
+        temp_output = file_path.with_name(f"temp_{file_path.name}")
+
         try:
-            # SQL logic: 
-            # 1. Exclude the raw binary column
-            # 2. Convert that binary to a readable WKT string
-            con.execute(f"""
-                COPY (
+            # Look at the headers of the current AIS file
+            if ext == '.parquet':
+                cols_query = f"DESCRIBE SELECT * FROM read_parquet('{file_path}')"
+            else:
+                cols_query = f"DESCRIBE SELECT * FROM read_csv_auto('{file_path}')"
+            
+            actual_cols = [c[0] for c in con.execute(cols_query).fetchall()]
+
+            # Identify which "Type" column exists in this specific year's data
+            # There are multiple versions for different years
+            type_col = None
+            for variant in ['VesselType', 'vessel_type', 'Vessel_Type', 'vesseltype']:
+                if variant in actual_cols:
+                    type_col = variant
+                    break
+            
+            if not type_col:
+                print(f"  SKIPPING: No vessel type column found in {file_path.name}")
+                continue
+
+            # Build the Join Query
+            # Use EXCLUDE (join_key) so the temporary column doesn't save to the file
+            source_func = f"read_parquet('{file_path}')" if ext == '.parquet' else f"read_csv_auto('{file_path}')"
+            
+            query = f"""
+                SELECT 
+                    main.* EXCLUDE (
+                        join_key, 
+                    ), 
+                    map.Vessel_Group 
+                FROM (
                     SELECT 
-                        * EXCLUDE (geometry_wkb), 
-                        ST_AsText(ST_GeomFromWKB(geometry_wkb)) AS geometry
-                    FROM read_parquet('{p_file}')
-                ) TO '{csv_file}' (HEADER, DELIMITER ',');
-            """)
-            print(f"Successfully exported: {csv_file.name}")
+                        *, 
+                        TRY_CAST("{type_col}" AS INTEGER) AS join_key
+                    FROM {source_func}
+                ) AS main
+                LEFT JOIN vessel_mapping AS map 
+                    ON main.join_key = map.Vessel_Type
+            """
+
+            # Execute the export
+            if ext == '.parquet':
+                con.execute(f"COPY ({query}) TO '{temp_output}' (FORMAT 'PARQUET', COMPRESSION 'ZSTD')")
+            else:
+                con.execute(f"COPY ({query}) TO '{temp_output}' (FORMAT 'CSV', HEADER)")
+
+            # Atomic Swap (Replace original with updated version)
+            file_path.unlink() 
+            temp_output.rename(file_path)
             
         except Exception as e:
-            print(f"Failed to convert {p_file.name}: {e}")
+            print(f"  ERROR on {file_path.name}: {e}")
+            if temp_output.exists():
+                temp_output.unlink()
 
-def filter_ais_by_project_vessels():
+    print("--- Processing Complete ---")
+
+if __name__ == "__main__":
+    add_vessel_groups_recursive()
+
+
+# --- FILTER FOR CONSTRUCTION RELATED VESSELS IN DATA ---
+# --- CONFIGURATION ---
+YEARS = range(2017, 2026)  # 2017 to 2025
+TARGET_MONTHS = [f"{m:02d}" for m in range(1, 13)]
+vessel_csv = home_directory / "Documents" / "positron" / "PEMAD-MDEB-Vessel_Traffic_AIS" / "data" / "OSW_Vessels_MMSI.csv"
+construction_output_base = project_path / "AIS_ConstructionVessels"
+
+def filter_ais_by_project_vessels_multiyear():
     """
-    Filters a directory of AIS Parquet files based on a CSV of specific 
-    MMSIs and their associated project start/end dates.
+    Loops through years and months to filter AIS Parquet files
+    by project vessel MMSIs and dates, outputting monthly CSVs.
     """
-    # Read Vessel/Project CSV into a Pandas DataFrame
+    # 1. Prepare Project Vessel Data
     print(f"Reading project vessel list from: {vessel_csv}")
     project_vessels = pd.read_csv(vessel_csv)
-    
-    # Ensure Date columns are actual datetime objects for the filter
     project_vessels['Start'] = pd.to_datetime(project_vessels['Start'])
     project_vessels['End'] = pd.to_datetime(project_vessels['End'])
     
-    # Initialize DuckDB with Spatial support
+    # 2. Initialize DuckDB
     con = duckdb.connect()
     con.execute("INSTALL spatial; LOAD spatial;")
-    
-    # Use a glob pattern to treat all monthly parquets as one table
-    parquet_pattern = Path(output_dir) / "*.parquet"
-    
-    print("Starting Join and Filter (Parquet -> CSV)...")
-    
-    # The Power Query
-    # It only keeps rows where the MMSI matches AND the date is within the window.
-    query = f"""
-        COPY (
-            SELECT 
-                main.* EXCLUDE (geometry_wkb),
-                ST_AsText(ST_GeomFromWKB(main.geometry_wkb)) AS geometry
-            FROM read_parquet('{parquet_pattern}') AS main
-            JOIN project_vessels AS pv 
-              ON main.MMSI = pv.MMSI
-            WHERE CAST(main.BaseDateTime AS TIMESTAMP) >= pv.Start
-              AND CAST(main.BaseDateTime AS TIMESTAMP) <= pv.End
-        ) TO '{output_csv}' (HEADER, DELIMITER ',');
-    """
-    
-    try:
-        con.execute(query)
-        print(f"Success! Filtered data saved to: {output_csv}")
-    except Exception as e:
-        print(f"Error during processing: {e}")
+    # Register the dataframe once
+    con.register('project_vessels', project_vessels)
+
+    # 3. Create Output Parent Directory
+    construction_output_base.mkdir(parents=True, exist_ok=True)
+
+    # 4. Nested Loop: Year -> Month
+    for year in YEARS:
+        # Path to where your monthly parquets are stored
+        input_dir = project_path / f"AIS_Monthly_{year}"
+        
+        if not input_dir.exists():
+            print(f"Skipping Year {year}: Directory not found.")
+            continue
+
+        for month in TARGET_MONTHS:
+            # Define input and output file paths
+            # Matches format: AIS_2021_06.parquet
+            p_file = input_dir / f"AIS_{year}_{month}.parquet"
+            output_csv = construction_output_base / f"Vessels_AIS_{year}_{month}.csv"
+
+            if not p_file.exists():
+                continue # Skip months that don't have data
+
+            if output_csv.exists():
+                print(f"  Skipping {year}-{month}: CSV already exists.")
+                continue
+
+            print(f"Filtering {year}-{month} for project vessels...")
+
+            # --- THE QUERY ---
+            query = f"""
+                COPY (
+                    SELECT 
+                        main.* EXCLUDE (geometry_wkb),
+                        ST_AsText(ST_GeomFromWKB(main.geometry_wkb)) AS geometry
+                    FROM read_parquet('{p_file}', union_by_name=True) AS main
+                    JOIN project_vessels AS pv 
+                      ON main.mmsi = pv.MMSI
+                    WHERE CAST(main.base_date_time AS TIMESTAMP) >= pv.Start
+                      AND CAST(main.base_date_time AS TIMESTAMP) <= pv.End
+                ) TO '{output_csv}' (HEADER, DELIMITER ',');
+            """
+
+            try:
+                con.execute(query)
+                # Check if the file was created and has data (header + rows)
+                # DuckDB creates the file even if 0 results match; we can check size
+                if output_csv.stat().st_size < 100: 
+                     print(f"    Note: No matching vessels found for {year}-{month}")
+            except Exception as e:
+                print(f"    Error processing {year}-{month}: {e}")
 
 if __name__ == "__main__":
-    run_stage_1()
-    #merge_daily_to_monthly()
-    #convert_monthly_parquet_to_csv()
-    #filter_ais_by_project_vessels()
+    filter_ais_by_project_vessels_multiyear()
+
+
+# --- CREATE YEARLY FILE GEODATABASES ---
+
+# --- CONFIGURATION ---
+input_base_dir = Path("D:/AIS_ConstructionVessels")
+gdb_output_dir = Path("D:/AIS_Geodatabases")
+gdb_output_dir.mkdir(parents=True, exist_ok=True)
+
+YEARS = range(2025, 2026)
+
+def create_yearly_gdbs_no_arcpy():
+    print("Starting Geodatabase Creation (Non-ArcPy)...")
+
+    for year in YEARS:
+        # Define GDB path
+        gdb_path = gdb_output_dir / f"Vessels_AIS_{year}.gdb"
+        
+        # Find all CSVs for this year
+        csv_files = list(input_base_dir.glob(f"Vessels_AIS_{year}_*.csv"))
+
+        if not csv_files:
+            continue
+
+        print(f"\n--- Processing Year {year} ({len(csv_files)} files) ---")
+
+        for csv_path in csv_files:
+            # Create a layer name (e.g., Month_01)
+            month_val = csv_path.stem.split('_')[-1]
+            layer_name = f"Vessels_AIS_{year}_{month_val}"
+
+            print(f"  Converting {csv_path.name} to GDB Layer...")
+
+            try:
+                # 1. Load CSV
+                df = pd.read_csv(csv_path)
+
+                if df.empty:
+                    print(f"    Note: {csv_path.name} is empty. Skipping.")
+                    continue
+
+                # 2. Convert WKT string to actual Geometry objects
+                # Your CSV has a 'geometry' column with 'POINT (lon lat)'
+                df['geometry'] = df['geometry'].apply(shapely.wkb.loads if 'wkb' in csv_path.name else shapely.wkt.loads)
+                
+                # 3. Create GeoDataFrame
+                # AIS data is WGS84 (EPSG:4326)
+                gdf = gpd.GeoDataFrame(df, geometry='geometry', crs="EPSG:4326")
+
+                # 4. Write to File Geodatabase using pyogrio
+                # 'engine="pyogrio"' is required for GDB writing without arcpy
+                gdf.to_file(
+                    str(gdb_path), 
+                    layer=layer_name, 
+                    driver="OpenFileGDB", 
+                    engine="pyogrio"
+                )
+                print(f"    Successfully added {layer_name} to {gdb_path.name}")
+
+            except Exception as e:
+                print(f"    Error processing {csv_path.name}: {e}")
+
+if __name__ == "__main__":
+    create_yearly_gdbs_no_arcpy()
