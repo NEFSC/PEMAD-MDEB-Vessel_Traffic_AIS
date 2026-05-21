@@ -42,9 +42,10 @@ def extract_multi_keyword_pages(folder_path, keywords, output_filename):
     
     result_pdf.close()
 
-# Usage
+# ----- USAGE -------
+
 home_dir = Path.home()
-# Change file path for pdfs of interest
+# Change file path based on location of PDFs of interest
 file_path = home_dir / "Documents" / "AIS" / "USCG_LNM" / "District1" / "D01LNM2022"
 # Change keywords depending on search
 my_keywords = ["wind", "southcoast", "south fork", "sunrise", "beacon", "vineyard", "empire", "bay state", "geotechnical"]

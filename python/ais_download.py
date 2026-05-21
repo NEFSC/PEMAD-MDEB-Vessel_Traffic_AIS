@@ -25,12 +25,23 @@ parquet_lock = threading.Lock()
 YEARS_TO_DOWNLOAD = range(2015, 2026) # 2015 through 2025
 TARGET_MONTHS = [f"{m:02d}" for m in range(1, 13)]
 
+# Path to where data will be saved
 project_path = Path("D:/")
-home_directory = Path.home()
-arcgis_path = home_directory / "Documents" / "ArcGIS" / "Projects" / "AIS_Download"
+
+# Find Bounding Box fgd in current directory
+current_dir = Path.cwd()
+project_root = None
+for parent in [current_dir] + list(current_dir.parents):
+    if (parent / "data").is_dir() and (parent / "python").is_dir():
+        project_root = parent
+        break
+
+# 3. Fallback just in case it's running somewhere weird
+if not project_root:
+    project_root = current_dir
 
 # --- LOAD BOUNDING BOX ---
-gdb_path = arcgis_path / "BoundingBox.gdb"
+gdb_path = project_root / "data" / "BoundingBox.gdb"
 layer_name = "SNE_BoundingBox"
 
 try:
@@ -77,8 +88,11 @@ def download_and_filter(url, current_staging_dir):
                 # --- DATA QUALITY FILTERS ---
                 df['sog'] = pd.to_numeric(df['sog'], errors='coerce')
                 df['mmsi'] = pd.to_numeric(df['mmsi'], errors='coerce')
+                # Remove rows where MMSI or SOG is NA
                 df = df.dropna(subset=['mmsi', 'sog'])
+                # Remove rows where the MMSI number is not 9 digits (all vessel MMSI should be 9 digits, bad data)
                 df = df[(df['mmsi'] >= 100000000) & (df['mmsi'] <= 999999999)]
+                # Remove rows where the SOG >40 (impossible speed, bad data)
                 df = df[df['sog'] <= 40]
 
                 if 'vessel_name' in df.columns:
@@ -86,7 +100,8 @@ def download_and_filter(url, current_staging_dir):
                 if 'base_date_time' in df.columns:
                     df['base_date_time'] = pd.to_datetime(df['base_date_time'], errors='coerce')
 
-                # BOUNDING BOX SPATIAL FILTER              
+                # BOUNDING BOX SPATIAL FILTER   
+                # Only grab AIS data within the bounding box           
                 mask = (df['latitude'] >= YMIN) & (df['latitude'] <= YMAX) & \
                        (df['longitude'] >= XMIN) & (df['longitude'] <= XMAX)
                 
@@ -100,7 +115,7 @@ def download_and_filter(url, current_staging_dir):
 
                     with parquet_lock:
                         filtered.to_parquet(out_path, index=False, engine='pyarrow')
-                    
+                    # Save as parquet file 
                     return f"SAVED: {parquet_name} ({len(filtered):,} points)"
                 return f"EMPTY: {parquet_name}"
                 
@@ -136,7 +151,7 @@ def process_year(year):
 
         # 3. DOWNLOAD IN PARALLEL
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-            # We use a helper to pass both the URL and the year-specific staging dir
+            # Use a helper to pass both the URL and the year-specific staging dir
             results = list(executor.map(lambda u: download_and_filter(u, staging_dir), zst_links))
         
         for res in filter(None, results): 
@@ -177,7 +192,6 @@ def merge_daily_to_monthly_multiyear(years_list):
             daily_files_list = list(current_staging_dir.glob(daily_glob))
             
             if not daily_files_list:
-                # We use a f-string for the skip message to be clear which year failed
                 print(f"Skipping {year}-{month}: No daily files found in {current_staging_dir}")
                 continue
                 
@@ -197,7 +211,8 @@ def merge_daily_to_monthly_multiyear(years_list):
                 
                 print(f"Successfully created: {monthly_file.name}")
                 
-                # --- OPTIONAL CLEANUP ---
+                ## --- OPTIONAL CLEANUP ---
+                ## Remove daily files 
                 # for f in daily_files_list:
                 #     os.remove(f)
                 
@@ -206,17 +221,20 @@ def merge_daily_to_monthly_multiyear(years_list):
 
 # --- RUN ---
 if __name__ == "__main__":
-    # You can pass a range or a specific list
+    # Pass a year range or a specific list
     target_years = range(2015, 2026) 
     merge_daily_to_monthly_multiyear(target_years)
 
 # --- CONVERT MONTHLY PARQUET TO MONTHLY CSV
+# I did it this way because it was much faster to first create parquet files, then convert them to csv
+# as opposed to only making csv files
+# Utlizing DuckDB to create parquet files is very fast for download/filtering 
 def convert_monthly_parquet_to_csv_multiyear(years_list):
     """
     Iterates through multiple years, finds monthly Parquet files, 
     and converts them to CSV with readable WKT geometry.
     """
-    # Initialize DuckDB with Spatial support once
+    # Initialize DuckDB with Spatial support
     con = duckdb.connect()
     con.execute("INSTALL spatial; LOAD spatial;")
 
@@ -277,7 +295,7 @@ if __name__ == "__main__":
 # Add a column vessel group to all the final data
 
 data_dir = Path("D:/AIS_Monthly_2025")
-mapping_csv = home_directory / "Documents" / "positron" / "PEMAD-MDEB-Vessel_Traffic_AIS" / "data" / "vesseltypecodes.csv"
+mapping_csv = project_root / "data" / "vesseltypecodes.csv"
 
 def add_vessel_groups_recursive():
     con = duckdb.connect()
@@ -371,7 +389,7 @@ if __name__ == "__main__":
 # --- CONFIGURATION ---
 YEARS = range(2017, 2026)  # 2017 to 2025
 TARGET_MONTHS = [f"{m:02d}" for m in range(1, 13)]
-vessel_csv = home_directory / "Documents" / "positron" / "PEMAD-MDEB-Vessel_Traffic_AIS" / "data" / "OSW_Vessels_MMSI.csv"
+vessel_csv = project_root / "data" / "OSW_Vessels_MMSI.csv"
 construction_output_base = project_path / "AIS_ConstructionVessels"
 
 def filter_ais_by_project_vessels_multiyear():
@@ -396,7 +414,7 @@ def filter_ais_by_project_vessels_multiyear():
 
     # 4. Nested Loop: Year -> Month
     for year in YEARS:
-        # Path to where your monthly parquets are stored
+        # Path to where monthly parquets are stored
         input_dir = project_path / f"AIS_Monthly_{year}"
         
         if not input_dir.exists():
@@ -419,6 +437,8 @@ def filter_ais_by_project_vessels_multiyear():
             print(f"Filtering {year}-{month} for project vessels...")
 
             # --- THE QUERY ---
+            # Find all AIS pings in data where MMSI and start and end date match 
+            # the OSW_Vessels_MMSI csv
             query = f"""
                 COPY (
                     SELECT 
@@ -435,7 +455,6 @@ def filter_ais_by_project_vessels_multiyear():
             try:
                 con.execute(query)
                 # Check if the file was created and has data (header + rows)
-                # DuckDB creates the file even if 0 results match; we can check size
                 if output_csv.stat().st_size < 100: 
                      print(f"    Note: No matching vessels found for {year}-{month}")
             except Exception as e:
@@ -445,7 +464,7 @@ if __name__ == "__main__":
     filter_ais_by_project_vessels_multiyear()
 
 
-# --- CREATE YEARLY FILE GEODATABASES ---
+# --- CREATE YEARLY CONSTRUCTION RELATED VESSEL FILE GEODATABASES ---
 
 # --- CONFIGURATION ---
 input_base_dir = Path("D:/AIS_ConstructionVessels")
@@ -454,8 +473,8 @@ gdb_output_dir.mkdir(parents=True, exist_ok=True)
 
 YEARS = range(2025, 2026)
 
-def create_yearly_gdbs_no_arcpy():
-    print("Starting Geodatabase Creation (Non-ArcPy)...")
+def create_yearly_gdbs():
+    print("Starting Geodatabase Creation...")
 
     for year in YEARS:
         # Define GDB path
@@ -471,6 +490,7 @@ def create_yearly_gdbs_no_arcpy():
 
         for csv_path in csv_files:
             # Create a layer name (e.g., Month_01)
+            # One layer per month in each yearly file geodatabase 
             month_val = csv_path.stem.split('_')[-1]
             layer_name = f"Vessels_AIS_{year}_{month_val}"
 
@@ -481,11 +501,10 @@ def create_yearly_gdbs_no_arcpy():
                 df = pd.read_csv(csv_path)
 
                 if df.empty:
-                    print(f"    Note: {csv_path.name} is empty. Skipping.")
+                    print(f"Note: {csv_path.name} is empty. Skipping.")
                     continue
 
                 # 2. Convert WKT string to actual Geometry objects
-                # Your CSV has a 'geometry' column with 'POINT (lon lat)'
                 df['geometry'] = df['geometry'].apply(shapely.wkb.loads if 'wkb' in csv_path.name else shapely.wkt.loads)
                 
                 # 3. Create GeoDataFrame
@@ -493,17 +512,16 @@ def create_yearly_gdbs_no_arcpy():
                 gdf = gpd.GeoDataFrame(df, geometry='geometry', crs="EPSG:4326")
 
                 # 4. Write to File Geodatabase using pyogrio
-                # 'engine="pyogrio"' is required for GDB writing without arcpy
                 gdf.to_file(
                     str(gdb_path), 
                     layer=layer_name, 
                     driver="OpenFileGDB", 
                     engine="pyogrio"
                 )
-                print(f"    Successfully added {layer_name} to {gdb_path.name}")
+                print(f"Successfully added {layer_name} to {gdb_path.name}")
 
             except Exception as e:
-                print(f"    Error processing {csv_path.name}: {e}")
+                print(f"Error processing {csv_path.name}: {e}")
 
 if __name__ == "__main__":
-    create_yearly_gdbs_no_arcpy()
+    create_yearly_gdbs()
